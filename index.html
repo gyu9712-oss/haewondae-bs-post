@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>Open‑Meteo 날씨 지도 (해운대 전용 · 이륜차 예방수칙)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#ffffff" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #map { height: 100vh; }
+    .legend { position: absolute; z-index: 1000; right: 12px; bottom: 12px; background: rgba(255,255,255,.95); padding: 8px 10px; border-radius: 8px; font: 12px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; box-shadow: 0 2px 10px rgba(0,0,0,.1); max-width: 260px; }
+    .legend div { display: flex; align-items: center; gap: 6px; margin: 3px 0; }
+    .legend .sw { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+    .badge { display:inline-block; padding:2px 8px; border-radius:10px; font-weight:600; color:#fff }
+    .muted { color:#666; font-size:12px }
+    pre { white-space: pre-wrap; margin: 6px 0 0; }
+    .toolbar { position:absolute; left:12px; top:12px; z-index:1000; background:rgba(255,255,255,.95); padding:8px 10px; border-radius:8px; box-shadow:0 2px 10px rgba(0,0,0,.1); font: 13px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial; display:flex; align-items:center; gap:8px }
+    .toolbar button{ cursor:pointer; border:1px solid #e5e7eb; background:#fff; padding:6px 10px; border-radius:8px }
+    .toolbar .dot{ width:8px; height:8px; border-radius:999px; background:#9ca3af; display:inline-block }
+  </style>
+</head>
+<body>
+  <div id="map" aria-label="해운대 날씨 및 이륜차 안전 지도"></div>
+
+  <div class="toolbar" role="group" aria-label="지도 도구">
+    <button id="refreshBtn" aria-label="데이터 새로고침">↻ 새로고침</button>
+    <span class="dot" id="statusDot" title="연결 상태"></span>
+    <span id="updated" class="muted">업데이트 대기…</span>
+  </div>
+
+  <div class="legend" aria-live="polite">
+    <b>위험도</b>
+    <div><span class="sw" style="background:#10b981"></span> 낮음</div>
+    <div><span class="sw" style="background:#3b82f6"></span> 보통</div>
+    <div><span class="sw" style="background:#f59e0b"></span> 주의</div>
+    <div><span class="sw" style="background:#dc2626"></span> 경계</div>
+    <div><span class="sw" style="background:#b91c1c"></span> 심각</div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js" crossorigin="anonymous"></script>
+  <script>
+    // 모든 자원 로드 후 초기화
+    window.addEventListener('load', () => {
+      try { init(); } catch (e) { showFatal(e); }
+    });
+
+    function showFatal(err){
+      const el = document.createElement('div');
+      el.style.cssText = 'position:fixed;inset:12px;z-index:2000;background:rgba(255,255,255,.97);border:1px solid #e5e7eb;border-radius:12px;padding:14px;font:14px system-ui;box-shadow:0 6px 20px rgba(0,0,0,.12)';
+      el.innerHTML = `<b>지도를 표시하지 못했습니다</b><br/><span class="muted">오류: ${err?.message || err}</span>`;
+      document.body.appendChild(el);
+      console.error(err);
+    }
+
+    function init(){
+      const KST = 'Asia/Seoul';
+      const FETCH_TIMEOUT_MS = 12000;
+
+      // 해운대만 표시
+      const cities = [ { name: '해운대', lat: 35.2183599, lon: 129.1201918 } ];
+
+      const OPEN_METEO = ({lat, lon}) => `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}` +
+        `&models=kma_seamless&current=temperature_2m,relative_humidity_2m,is_day,weather_code,rain,showers,snowfall,wind_speed_10m` +
+        `&timezone=${encodeURIComponent(KST)}&windspeed_unit=ms`;
+
+      const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+      const withTimeout = (p, ms) => Promise.race([ p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms)) ]);
+      const fmt = (n, dp=0) => (n===undefined || n===null || Number.isNaN(n)) ? '-' : Number(n).toFixed(dp);
+      const nowStr = () => new Date().toLocaleString('ko-KR', { timeZone: KST });
+
+      function weatherFromCode(code) {
+        if (code === 0) return { main: 'Clear', description: '맑음' };
+        if ([1,2,3].includes(code)) return { main: 'Clouds', description: code===1?'대체로 맑음': code===2?'부분 흐림':'흐림' };
+        if ([45,48].includes(code)) return { main: 'Fog', description: '안개/짙은 안개' };
+        if ([51,53,55,56,57].includes(code)) return { main: 'Drizzle', description: '이슬비/언 이슬비' };
+        if ([61,63,65,66,67,80,81,82].includes(code)) return { main: 'Rain', description: '비/소나기' };
+        if ([71,73,75,77,85,86].includes(code)) return { main: 'Snow', description: '눈/소낙눈' };
+        if ([95,96,99].includes(code)) return { main: 'Thunderstorm', description: '뇌우' };
+        return { main: 'Clouds', description: '흐림' };
+      }
+
+      function colorForLevel(level) {
+        return level === '심각' ? '#b91c1c' : level === '경계' ? '#dc2626' : level === '주의' ? '#f59e0b' : level === '보통' ? '#3b82f6' : '#10b981';
+      }
+
+      function assessHazard({ main, tempC, windMs, rainMm, snowMm }) {
+        let level = '보통';
+        let type = main;
+        let tips = [];
+        const set = (lvl, typ, arr) => { level = lvl; type = typ; tips = arr.slice(); };
+
+        if (main === 'Thunderstorm') {
+          set(rainMm > 10 ? '심각' : '경계', '뇌우/호우', [
+            '강한 비·번개 시 운행 중지, 실내 대기',
+            '지하차도·하천 인근 침수 도로 진입 금지',
+            '시야 급감: 속도 30% 감속(비상등은 정차 시 사용)'
+          ]);
+        } else if (main === 'Rain' || main === 'Drizzle') {
+          set(rainMm > 30 ? '심각' : rainMm > 10 ? '경계' : '주의', '비/젖은 노면', [
+            '감속(평소 대비 20~30%), 제동거리 2배',
+            '맨홀·도색·철판·빗물받이 위 통과 금지',
+            '헬멧 김서림 방지, 방수 장갑 착용'
+          ]);
+        } else if (main === 'Snow') {
+          set(snowMm > 5 ? '경계' : '주의', '대설/결빙', [
+            '블랙아이스 시간대 운행 자제·근무시간 조정',
+            '급가감속 금지, 직진 시 후륜 제동 비중 낮추기',
+            '방한 장비 착용, 체온 저하 시 즉시 휴식'
+          ]);
+        } else if (main === 'Clear') {
+          if (tempC >= 35) {
+            set('경계', '폭염', [
+              '30~60분 간격 그늘 휴식·수분 보충',
+              '통풍형 자켓/이너, 쿨링 타월 활용',
+              '어지럼·두통 등 열질환 징후 시 즉시 중지'
+            ]);
+          } else if (tempC >= 33) {
+            set('주의', '폭염', [
+              '그늘 휴식·수분 보충',
+              '진한 색/두꺼운 장비 피하기',
+              '카페인 과다섭취 자제'
+            ]);
+          } else if (tempC <= -10) {
+            set('경계', '한파', [
+              '핸들워머/토시·핫팩으로 손 감각 유지',
+              '아침 교량·그늘길 블랙아이스 주의, 서행',
+              '시동 전 타이어 공기압·균열 점검'
+            ]);
+          } else {
+            set('낮음', '맑음', [ 'PPE(풀페이스 헬멧·장갑·부츠·보호대) 필수 착용' ]);
+          }
+        } else if (main === 'Clouds') {
+          set('보통', '구름/건조 노면', [ '규정 속도·차간거리 3초 이상, 피로 누적 시 휴식' ]);
+        } else if (main === 'Fog') {
+          set('주의', '안개/박무', [ '저속 주행, 상시 로우빔/안개등', '차폭 유지(중앙선·갓길 접근 금지)', '차로 변경 최소화, 차간거리 4초+' ]);
+        }
+
+        if (windMs >= 14) {
+          const windLevel = windMs >= 20 ? '심각' : '경계';
+          set(windLevel, '강풍/돌풍', [
+            '횡풍 구간(교량·해안·고가) 회피, 통과 시 저속·차로 중앙',
+            '대형차 추월 금지(와류 위험), 적재물 재결속',
+            '차체를 바람 방향으로 약간 기울여 균형 유지'
+          ]);
+        }
+
+        tips.push('공통: T-CLOCS 점검, PPE 착용, 차간거리 3~4초, 적재 균형 유지');
+        return { level, type, tips };
+      }
+
+      function incidentInfo({ main, windMs }) {
+        let count = 0;
+        const cases = [];
+        if (main === 'Rain' || main === 'Drizzle' || main === 'Thunderstorm') {
+          count += 2;
+          cases.push('빗길에 어두운 환경에서 귀국 중, 도로 노면의 물웅덩이를 피해 차선의 바깥 쪽으로 운전하다 서행중이던 옆차선의 승용차 사이드 미러와 충돌하여 이륜차와 넘어져 허리 부상 발생');
+        }
+        if (main === 'Snow') {
+          count += 1;
+          cases.push('배달을 위해 오르막길 운행중, 결빙된 구간에서 이륜차가 미끄러지며 넘어짐');
+        }
+        if (windMs >= 14) {
+          count += 2;
+          cases.push("우편물을 배송하고 건물에서 나오는 중, 태풍 '찬투'의 영향으로 강한 바람이 불어 세게 닫히려는 현관물을 잡으려다 왼쪽 손목을 크게 부딪힘");
+        }
+        return { count, cases };
+      }
+
+      // 지도 생성
+      const map = L.map('map', { tap: false });
+      map.setView([35.2183599, 129.1201918], 12);
+
+      const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '© OpenStreetMap contributors',
+        maxZoom: 19,
+        tileSize: 256
+      });
+      osm.addTo(map);
+
+      L.control.scale({ metric: true, imperial: false }).addTo(map);
+
+      const markerLayer = L.layerGroup().addTo(map);
+      const circleLayer = L.layerGroup().addTo(map);
+
+      const updatedEl = document.getElementById('updated');
+      const statusDot = document.getElementById('statusDot');
+
+      function cityPopup({name, wc, temp, humidity, wind, rain, snow, hazard}) {
+        const incident = incidentInfo({ main: wc.main, windMs: wind });
+        const badge = `<span class="badge" style="background:${colorForLevel(hazard.level)}">${hazard.level}</span>`;
+        const incidentBlock = incident.count > 0
+          ? `\n<b>⚠️ 안전사고 정보</b><br/>안전사고: <b>${incident.count}건</b><br/>사고사례:<pre>${incident.cases.map(c => `- ${c}`).join('\n')}</pre>`
+          : '';
+
+        return `📍 <b>${name}</b><br/>
+          🌤️ 상태: ${wc.description} <span style="display:inline-block;padding:2px 6px;border-radius:10px;border:1px solid #cfe;color:#456;background:#eef;margin-left:4px">${wc.main}</span><br/>
+          🌡️ 기온: <b>${fmt(temp,0)}°C</b> · 💧 습도: ${fmt(humidity,0)}% · 🌬️ 풍속: ${fmt(wind,1)} m/s<br/>
+          🌧️ 강수(현재): ${fmt(rain,1)} mm · ❄️ 적설(현재): ${fmt(snow,1)} mm<br/><br/>
+          <b>🛡️ 이륜차 예방책</b> ${badge}<br/>
+          상황 분류: <b>${hazard.type}</b>
+          <pre>${hazard.tips.map(t => `- ${t}`).join('\n')}</pre>
+          ${incidentBlock}
+          <div class="muted">* 데이터: Open‑Meteo(kma_seamless) · 시간대: ${KST}</div>`;
+      }
+
+      async function fetchCityWeather(city, retries=1) {
+        const url = OPEN_METEO(city);
+        try {
+          statusDot.style.background = '#f59e0b'; // fetching
+          const res = await withTimeout(fetch(url, { cache: 'no-store' }), FETCH_TIMEOUT_MS);
+          if (!res.ok) throw new Error(`Open‑Meteo 오류: ${res.status}`);
+          const data = await res.json();
+          const cur = data.current || {};
+          const wc = weatherFromCode(cur.weather_code ?? 3);
+          const temp = cur.temperature_2m;
+          const humidity = cur.relative_humidity_2m;
+          const wind = cur.wind_speed_10m;
+          const rain = Math.max(cur.rain ?? 0, cur.showers ?? 0);
+          const snow = cur.snowfall ?? 0;
+          const hazard = assessHazard({ main: wc.main, tempC: temp, windMs: wind, rainMm: rain, snowMm: snow });
+          statusDot.style.background = '#10b981'; // success
+          return { wc, temp, humidity, wind, rain, snow, hazard };
+        } catch (e) {
+          if (retries > 0) { await sleep(500); return fetchCityWeather(city, retries-1); }
+          statusDot.style.background = '#dc2626'; // error
+          throw e;
+        }
+      }
+
+      function drawCity(city, info) {
+        const marker = L.marker([city.lat, city.lon]).addTo(markerLayer);
+        marker.bindPopup(cityPopup({ name: city.name, ...info }), { maxWidth: 320 });
+        const color = colorForLevel(info.hazard.level);
+        L.circleMarker([city.lat, city.lon], { radius: 16, color, fillColor: color, fillOpacity: 0.25 }).addTo(circleLayer);
+      }
+
+      async function render(batch = cities) {
+        markerLayer.clearLayers();
+        circleLayer.clearLayers();
+        updatedEl.textContent = '불러오는 중…';
+
+        for (const city of batch) {
+          try {
+            const info = await fetchCityWeather(city);
+            drawCity(city, info);
+          } catch (e) {
+            const m = L.marker([city.lat, city.lon]).addTo(markerLayer);
+            m.bindPopup(`❌ <b>${city.name}</b><br/>날씨 정보를 불러올 수 없습니다.`);
+          }
+        }
+        updatedEl.textContent = `업데이트: ${nowStr()}`;
+      }
+
+      document.getElementById('refreshBtn').addEventListener('click', () => render());
+      render();
+    }
+  </script>
+</body>
+</html>
